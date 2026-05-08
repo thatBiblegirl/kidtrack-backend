@@ -5,6 +5,8 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import os
+import urllib.request
+import json as pyjson
 
 app = Flask(__name__)
 CORS(app)
@@ -12,11 +14,90 @@ CORS(app)
 # Config
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///kidtrack.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'kidtrack-secret-change-in-production'
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET', 'kidtrack-secret-change-in-production')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
+
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+APP_URL = 'https://kids-track-sigma.vercel.app'
+
+# ─────────────────────────────────────────
+# EMAIL HELPERS
+# ─────────────────────────────────────────
+
+def send_email(to, subject, html):
+    if not RESEND_API_KEY:
+        return
+    try:
+        payload = pyjson.dumps({
+            'from': 'KidTrack <onboarding@resend.dev>',
+            'to': [to],
+            'subject': subject,
+            'html': html
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=payload,
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type': 'application/json'
+            }
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f'Email error: {e}')
+
+
+def send_welcome_email(name, email, role):
+    role_label = 'Teacher' if role == 'teacher' else 'Parent'
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+        <div style="background: #4CAF7D; border-radius: 16px; padding: 24px; text-align: center; margin-bottom: 24px;">
+            <div style="font-size: 48px; margin-bottom: 8px;">⭐</div>
+            <h1 style="color: white; margin: 0; font-size: 28px;">Welcome to KidTrack!</h1>
+        </div>
+        <p style="font-size: 16px; color: #333;">Hi <strong>{name}</strong>,</p>
+        <p style="font-size: 16px; color: #333;">
+            You've successfully joined KidTrack as a <strong>{role_label}</strong>.
+            {'You can now add children and post daily updates for parents.' if role == 'teacher' else 'You can now view your child\'s daily updates from their teacher.'}
+        </p>
+        <div style="text-align: center; margin: 32px 0;">
+            <a href="{APP_URL}" style="background: #4CAF7D; color: white; padding: 14px 32px; border-radius: 12px; text-decoration: none; font-weight: bold; font-size: 16px;">
+                Open KidTrack →
+            </a>
+        </div>
+        <p style="font-size: 13px; color: #999; text-align: center;">Keeping families connected to the classroom</p>
+    </div>
+    """
+    send_email(email, f'Welcome to KidTrack, {name}! 🌟', html)
+
+
+def send_update_notification(parent_email, parent_name, child_name, mood, notes, activities):
+    mood_emoji = {'happy': '😄', 'okay': '🙂', 'sad': '😢', 'tired': '😴'}.get(mood, '😊')
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+        <div style="background: #4CAF7D; border-radius: 16px; padding: 24px; text-align: center; margin-bottom: 24px;">
+            <div style="font-size: 48px; margin-bottom: 8px;">⭐</div>
+            <h1 style="color: white; margin: 0; font-size: 24px;">New Update for {child_name}</h1>
+        </div>
+        <p style="font-size: 16px; color: #333;">Hi <strong>{parent_name}</strong>,</p>
+        <p style="font-size: 16px; color: #333;">{child_name}'s teacher just posted today's update!</p>
+        <div style="background: #f5f5f5; border-radius: 12px; padding: 16px; margin: 16px 0;">
+            <p style="margin: 8px 0; font-size: 15px;"><strong>Mood:</strong> {mood_emoji} {mood.capitalize()}</p>
+            {f'<p style="margin: 8px 0; font-size: 15px;"><strong>Activities:</strong> {activities}</p>' if activities else ''}
+            {f'<p style="margin: 8px 0; font-size: 15px;"><strong>Notes:</strong> {notes}</p>' if notes else ''}
+        </div>
+        <div style="text-align: center; margin: 32px 0;">
+            <a href="{APP_URL}" style="background: #4CAF7D; color: white; padding: 14px 32px; border-radius: 12px; text-decoration: none; font-weight: bold; font-size: 16px;">
+                View Full Update →
+            </a>
+        </div>
+        <p style="font-size: 13px; color: #999; text-align: center;">KidTrack — Keeping families connected to the classroom</p>
+    </div>
+    """
+    send_email(parent_email, f'📚 {child_name} had a {mood} day! {mood_emoji}', html)
 
 
 # ─────────────────────────────────────────
@@ -139,6 +220,13 @@ def register():
     db.session.commit()
 
     token = create_access_token(identity={'id': user.id, 'role': user.role, 'school_id': user.school_id})
+
+    # Send welcome email
+    try:
+        send_welcome_email(user.name, user.email, user.role)
+    except:
+        pass
+
     return jsonify({'token': token, 'user': user.to_dict()}), 201
 
 
@@ -291,6 +379,19 @@ def post_update(child_id):
     )
     db.session.add(update)
     db.session.commit()
+
+    # Notify parent by email if child has a parent linked
+    try:
+        if child.parent_id:
+            parent = User.query.get(child.parent_id)
+            if parent:
+                send_update_notification(
+                    parent.email, parent.name, child.name,
+                    update.mood, update.notes, update.activities
+                )
+    except:
+        pass
+
     return jsonify(update.to_dict()), 201
 
 
